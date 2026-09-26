@@ -12,6 +12,11 @@
 求得后，残量网络中从超级源可达的节点集合，恰好是所有最小割源侧的
 交集（最小割源侧关于交、并封闭）。对该集合取"源侧 -> 汇侧"的管段
 即得唯一的最小切断清单，与管段提交顺序无关。
+
+执行复核可传入 removed_segment_ids：这些边在算法视角已被物理移除。
+若移除后已经不存在任何污染源到保护区的有向路径，新增清单固定为空，
+源侧见证为剩余有向网络中从污染源物理可达的节点集合；未移除边的普通
+计算仍使用原有 Dinic 最小源侧裁决。
 """
 
 from collections import deque
@@ -95,16 +100,20 @@ class Dinic:
         return seen
 
 
-def solve_min_cut(plan):
+def solve_min_cut(plan, removed_segment_ids=None):
     """求解方案的最小费用隔断。
 
     plan: {"zones": [...], "segments": [{"id", "from", "to", "cost"}],
            "sources": [...], "protections": [...]}
+    removed_segment_ids: 视为已从该有向网络中移除的管段 ID 集合。
+        执行复核时，这些现场已关闭管段不能再次作为新增建议，也不参与
+        残量网络与费用计算；传入的 plan 本身保持不变。
     返回: {"source_zones": 升序源侧区域, "cut_segments": 升序切断管段,
            "total_cost": 总费用}
     """
     zones = plan["zones"]
-    segments = plan["segments"]
+    removed = set(removed_segment_ids or ())
+    segments = [seg for seg in plan["segments"] if seg["id"] not in removed]
     sources = plan["sources"]
     protections = plan["protections"]
 
@@ -122,6 +131,28 @@ def solve_min_cut(plan):
         dinic.add_edge(index[zone], super_sink, infinity)
     for seg in segments:
         dinic.add_edge(index[seg["from"]], index[seg["to"]], seg["cost"])
+
+    # 执行复核中若移除边后已经按有向连接切断全部 source -> protection
+    # 路径，新增清单必须为空（即使存在零费用边，也不能把与保护区无关
+    # 的可达节点上的边误报为必要隔断）。普通计算仍完全沿用 Dinic 裁决，
+    # 从而保持既有零费用最小割语义不变。
+    adjacency = {}
+    for seg in segments:
+        adjacency.setdefault(index[seg["from"]], []).append(index[seg["to"]])
+    seen = {index[zone] for zone in sources}
+    stack = list(seen)
+    while stack:
+        node = stack.pop()
+        for nxt in adjacency.get(node, []):
+            if nxt not in seen:
+                seen.add(nxt)
+                stack.append(nxt)
+    if removed and seen.isdisjoint(index[zone] for zone in protections):
+        return {
+            "source_zones": sorted(zone for zone, i in index.items() if i in seen),
+            "cut_segments": [],
+            "total_cost": 0,
+        }
 
     dinic.max_flow(super_source, super_sink)
     reachable = dinic.reachable_from(super_source)

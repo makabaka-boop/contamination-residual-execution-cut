@@ -26,7 +26,10 @@
 - 采用事务先对 plans 行加行锁串行化并发采用：仅当当前生效采用在
   持锁前后一致时才允许写入，否则以 409 ADOPTION_CONFLICT 拒绝，
   保证并发采用的返回结果确定且与最终记录一致。任何失败/冲突都
-  回滚，当前方案与原采用快照不变。
+  回滚，当前方案与原采用快照不变；
+- 执行复核同样先对 plans 行加锁，再读取当前生效采用快照。校验、
+  残图最小割与写入只使用该快照中的冻结方案，不读取当前方案；失败
+  时回滚，不留下半条复核，也不修改方案、计算记录或采用快照。
 """
 
 import uuid
@@ -38,6 +41,7 @@ from sqlalchemy.exc import IntegrityError
 from . import models
 from .errors import ApiError
 from .flow import solve_min_cut
+from .validation import validate_closed_segments
 
 
 def get_plan_or_404(db, plan_id):
@@ -345,3 +349,163 @@ def get_adoption(db, plan_id):
             f"plan {plan_id!r} has no adopted result",
         )
     return adoption
+
+
+def _combined_witness(frozen_plan, closed_ids, additional_result):
+    """构造由现场关闭与新增建议合并后的隔断见证。
+
+    源侧集合沿用剩余有向网络上同一个最小源侧裁决；冻结方案中所有跨越
+    该源侧边界的管段，恰好由"现场已关闭的跨越边 + 剩余网络新增建议边"
+    组成。merged_segment_ids 还会包含虽未跨越最终边界但现场确实已关闭
+    的冗余管段，完整记录本次执行集合。
+    """
+    side = set(additional_result["source_zones"])
+    segment_by_id = {seg["id"]: seg for seg in frozen_plan["segments"]}
+    closed_set = set(closed_ids)
+
+    crossing_ids = [
+        seg["id"]
+        for seg in frozen_plan["segments"]
+        if seg["from"] in side and seg["to"] not in side
+    ]
+    closed_crossing_ids = sorted(closed_set & set(crossing_ids))
+    merged_ids = sorted(closed_set | additional_ids)
+    return {
+        "source_zones": additional_result["source_zones"],
+        # 严格意义上的割：冻结方案中所有源侧 -> 汇侧的管段。
+        "cut_segments": sorted(crossing_ids),
+        # 现场执行集合；可能包含不在最终割边界上的冗余关闭管段。
+        "merged_segment_ids": merged_ids,
+        "closed_segment_ids": list(closed_ids),
+        "closed_segments": list(closed_ids),
+        "closed_cut_segments": closed_crossing_ids,
+        "new_segments": additional_result["cut_segments"],
+        "additional_segments": additional_result["cut_segments"],
+        "additional_cut_segments": additional_result["cut_segments"],
+        "closed_cost": sum(segment_by_id[sid]["cost"] for sid in closed_crossing_ids),
+        "additional_cost": additional_result["total_cost"],
+        "total_cost": sum(segment_by_id[sid]["cost"] for sid in crossing_ids),
+    }
+
+
+def execution_review_view(review):
+    """对外响应；字段中的计划与结果均来自复核记录冻结的版本。"""
+    witness = review.combined_witness
+    return {
+        "review_id": review.review_id,
+        "plan_id": review.plan_id,
+        "plan_revision": review.plan_revision,
+        "computation_id": review.computation_id,
+        "created_at": review.created_at.isoformat(),
+        "plan": review.plan_snapshot,
+        "adopted_result": review.adopted_result,
+        "closed_segment_ids": list(review.closed_segment_ids),
+        "closed_segments": list(review.closed_segment_ids),
+        "additional_cut": review.additional_result,
+        "result": review.additional_result,
+        "new_segments": review.additional_result["cut_segments"],
+        "new_segment_ids": list(review.additional_result["cut_segments"]),
+        "recommended_segments": review.additional_result["cut_segments"],
+        "additional_cut_segments": list(review.additional_result["cut_segments"]),
+        "new_closed_segments": list(review.additional_result["cut_segments"]),
+        "additional_segments": list(review.additional_result["cut_segments"]),
+        "additional_cost": review.additional_cost,
+        "incremental_cost": review.additional_cost,
+        "combined_cut_witness": witness,
+        # 兼容直观命名：现场已关闭、新增建议、追加费用、合并见证。
+        "merged_cut_witness": witness,
+        "combined_witness": witness,
+        "witness": witness,
+    }
+
+
+def create_execution_review(db, plan_id, raw_body):
+    """对当前已采用结果新增一次执行复核。
+
+    复核只能引用该次采用冻结的方案：先对 plans 行加锁，再读取当前
+    adoption，使复核与采用替换在 PostgreSQL 上串行化；随后校验、算法、
+    持久化全部复用同一个 frozen_plan。任何校验/算法/写入错误都在事务内
+    回滚，不留下半条 execution_reviews 记录，也不修改原方案、计算记录
+    或采用快照。
+    """
+    get_plan_or_404(db, plan_id)
+
+    # 与 adopt 使用同一把 plans 行锁，确保读到的采用快照在本事务内稳定。
+    (
+        db.query(models.Plan)
+        .filter(models.Plan.plan_id == plan_id)
+        .with_for_update()
+        .one()
+    )
+    adoption = _get_adoption_row(db, plan_id)
+    if adoption is None:
+        db.rollback()
+        raise ApiError(
+            404,
+            "ADOPTION_NOT_FOUND",
+            f"plan {plan_id!r} has no adopted result to review",
+        )
+
+    snapshot = adoption.snapshot
+    computation_id = snapshot["computation_id"]
+    plan_revision = snapshot["plan_revision"]
+    frozen_plan = snapshot["plan"]
+    adopted_result = snapshot["result"]
+
+    # 校验未知/重复 ID 时只查采用时冻结的管段，不查当前已修订方案。
+    try:
+        closed_segment_ids = validate_closed_segments(frozen_plan, raw_body)
+    except ApiError:
+        db.rollback()
+        raise
+
+    try:
+        additional_result = solve_min_cut(frozen_plan, set(closed_segment_ids))
+        witness = _combined_witness(
+            frozen_plan, closed_segment_ids, additional_result
+        )
+    except Exception:
+        db.rollback()
+        raise ApiError(
+            500, "COMPUTATION_FAILED", "execution review computation failed"
+        )
+
+    review_id = uuid.uuid4().hex
+    created_at = datetime.now(timezone.utc)
+    review = models.ExecutionReview(
+        review_id=review_id,
+        plan_id=plan_id,
+        computation_id=computation_id,
+        plan_revision=plan_revision,
+        plan_snapshot=frozen_plan,
+        adopted_result=adopted_result,
+        closed_segment_ids=closed_segment_ids,
+        additional_result=additional_result,
+        additional_cost=additional_result["total_cost"],
+        combined_witness=witness,
+        created_at=created_at,
+    )
+    db.add(review)
+    try:
+        db.commit()
+    except Exception:
+        # 数据库写入失败时必须原子回滚；原方案/计算/采用均不得被改动。
+        db.rollback()
+        raise ApiError(
+            500,
+            "EXECUTION_REVIEW_WRITE_FAILED",
+            "failed to persist the execution review",
+        )
+    db.refresh(review)
+    return review
+
+
+def get_execution_review_or_404(db, plan_id, review_id):
+    review = db.get(models.ExecutionReview, review_id)
+    if review is None or review.plan_id != plan_id:
+        raise ApiError(
+            404,
+            "EXECUTION_REVIEW_NOT_FOUND",
+            f"execution review {review_id!r} does not exist for plan {plan_id!r}",
+        )
+    return review

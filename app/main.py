@@ -220,3 +220,35 @@ def get_adoption(
 ):
     """查询当前已采用结果（完整快照）。"""
     return services.get_adoption(db, plan_id).snapshot
+
+
+@app.post("/plans/{plan_id}/execution-reviews")
+@app.post("/plans/{plan_id}/reviews")
+@app.post("/plans/{plan_id}/adoption/reviews")
+@app.post("/plans/{plan_id}/adoption/execution-reviews")
+async def create_execution_review(
+    request: Request,
+    plan_id: str = Path(pattern=PLAN_ID_REGEX),
+    db: Session = Depends(get_db),
+):
+    """基于一次已采用结果的冻结方案新增执行复核。"""
+    body = await _json_body(request)
+    # 可能等待采用事务的 plans 行锁，放入工作线程以保持并发请求真实并行。
+    review = await to_thread.run_sync(
+        services.create_execution_review, db, plan_id, body
+    )
+    return services.execution_review_view(review)
+
+
+@app.get("/plans/{plan_id}/execution-reviews/{review_id}")
+@app.get("/plans/{plan_id}/reviews/{review_id}")
+@app.get("/plans/{plan_id}/adoption/reviews/{review_id}")
+@app.get("/plans/{plan_id}/adoption/execution-reviews/{review_id}")
+def get_execution_review(
+    plan_id: str = Path(pattern=PLAN_ID_REGEX),
+    review_id: str = Path(pattern=PLAN_ID_REGEX),
+    db: Session = Depends(get_db),
+):
+    """按 ID 读取重启后仍保留的、不可变的执行复核记录。"""
+    review = services.get_execution_review_or_404(db, plan_id, review_id)
+    return services.execution_review_view(review)

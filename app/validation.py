@@ -27,6 +27,85 @@ def _is_valid_id(value):
     return isinstance(value, str) and ID_PATTERN.fullmatch(value) is not None
 
 
+def validate_closed_segments(frozen_plan, data):
+    """校验一次执行复核中现场已关闭的管段 ID 集合。
+
+    ``frozen_plan`` 必须来自采用快照，而不是当前方案；这样接口、校验、
+    算法和持久化使用的都是同一冻结版本。返回按字典序规范化的 ID 列表，
+    重复或无法在冻结方案中识别的 ID 均拒绝且不写库。
+    """
+    field = "closed_segment_ids"
+    if not isinstance(data, dict) or field not in data:
+        # 兼容按语义命名的 closed_segments 请求字段。
+        field = "closed_segments"
+    if not isinstance(data, dict) or field not in data:
+        raise ApiError(
+            422,
+            "VALIDATION_ERROR",
+            "execution review payload is invalid",
+            [
+                _detail(
+                    "MISSING_CLOSED_SEGMENT_IDS",
+                    "closed_segment_ids",
+                    "a list is required",
+                )
+            ],
+        )
+    raw = data[field]
+    if not isinstance(raw, list):
+        raise ApiError(
+            422,
+            "VALIDATION_ERROR",
+            "execution review payload is invalid",
+            [_detail("INVALID_CLOSED_SEGMENTS_FIELD", field, "must be a list")],
+        )
+
+    details = []
+    known = {segment["id"] for segment in frozen_plan["segments"]}
+    closed = []
+    seen = set()
+    for i, segment_id in enumerate(raw):
+        item_field = f"{field}[{i}]"
+        if not _is_valid_id(segment_id):
+            details.append(
+                _detail(
+                    "INVALID_SEGMENT_ID",
+                    item_field,
+                    "segment id must match [A-Za-z0-9_-]{1,32}",
+                )
+            )
+            continue
+        if segment_id not in known:
+            details.append(
+                _detail(
+                    "UNKNOWN_SEGMENT",
+                    item_field,
+                    f"segment id {segment_id!r} is not in the adopted frozen plan",
+                )
+            )
+            continue
+        if segment_id in seen:
+            details.append(
+                _detail(
+                    "DUPLICATE_SEGMENT_ID",
+                    item_field,
+                    f"duplicate closed segment id {segment_id!r}",
+                )
+            )
+            continue
+        seen.add(segment_id)
+        closed.append(segment_id)
+
+    if details:
+        raise ApiError(
+            422,
+            "VALIDATION_ERROR",
+            "execution review payload is invalid",
+            details,
+        )
+    return sorted(closed)
+
+
 def validate_plan_payload(data):
     """校验并规范化方案负载，返回规范化字典；非法时抛出 ApiError。"""
     if not isinstance(data, dict):

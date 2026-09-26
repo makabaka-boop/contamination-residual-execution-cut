@@ -1,4 +1,4 @@
-"""持久化模型：方案、计算记录、采用快照与不可变采用历史。"""
+"""持久化模型：方案、计算记录、采用快照、采用历史与执行复核。"""
 
 from sqlalchemy import (
     JSON,
@@ -90,3 +90,30 @@ class AdoptionEvent(Base):
     plan_revision = Column(Integer, nullable=False)
     snapshot = Column(JSON, nullable=False)  # 采用时刻写入的完整快照
     adopted_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class ExecutionReview(Base):
+    """对一次已采用结果的不可变执行复核记录。"""
+
+    __tablename__ = "execution_reviews"
+
+    review_id = Column(String(32), primary_key=True)
+    plan_id = Column(
+        String(64), ForeignKey("plans.plan_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    computation_id = Column(
+        String(32),
+        ForeignKey("computations.computation_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # 复核所引用的采用冻结版本；不读取后来修订的同名管段。
+    plan_revision = Column(Integer, nullable=False)
+    plan_snapshot = Column(JSON, nullable=False)
+    adopted_result = Column(JSON, nullable=False)
+    closed_segment_ids = Column(JSON, nullable=False)
+    additional_result = Column(JSON, nullable=False)
+    additional_cost = Column(BigInteger, nullable=False)
+    combined_witness = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

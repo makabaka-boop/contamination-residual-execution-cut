@@ -62,6 +62,8 @@ docker compose up --build
 | `GET /plans/{plan_id}/computations/{computation_id}` | 查询计算记录 |
 | `POST /plans/{plan_id}/adopt` | 采用一次**成功**计算并保存该计算时刻冻结的完整快照；同一计算**至多采用一次**，即使后来被其他计算替换也不可再次采用；并发采用冲突返回 409 |
 | `GET /plans/{plan_id}/adoption` | 查询当前已采用结果（完整快照） |
+| `POST /plans/{plan_id}/execution-reviews` | 对**当前已采用结果**新增一次执行复核；提交现场确实已关闭的管段 ID，服务只使用该次采用冻结的方案，在移除这些边后的剩余有向网络上求新增最小费用隔断 |
+| `GET /plans/{plan_id}/execution-reviews/{review_id}` | 按 ID 读取不可变执行复核（重启后仍可读取） |
 
 ### 调用示例
 
@@ -149,16 +151,76 @@ curl http://localhost:8000/plans/demo/adoption
 }
 ```
 
+### 执行复核（施工中途追加隔断）
+
+现场已经关闭一部分管段后，工程师可对一次**已采用结果**提交复核。复核只引用
+该次采用时冻结的 `plan`、`plan_revision` 与最小割结果；之后方案即使修订、
+同名管段费用或方向改变，也不会混入本次复核。服务把请求中的管段视为已从
+冻结有向网络移除，在剩余网络上沿用同一套 64 位 Dinic 最小费用割、最小源侧
+与字典序裁决。
+
+```bash
+curl -X POST http://localhost:8000/plans/demo/execution-reviews \
+  -H 'content-type: application/json' \
+  -d '{"closed_segment_ids": ["p3"]}'
+```
+
+```json
+{
+  "review_id": "...",
+  "plan_id": "demo",
+  "plan_revision": 1,
+  "computation_id": "...",
+  "closed_segment_ids": ["p3"],
+  "additional_cut": {
+    "source_zones": ["MID", "SRC1", "SRC2"],
+    "cut_segments": ["p4"],
+    "total_cost": 7
+  },
+  "additional_cut_segments": ["p4"],
+  "additional_cost": 7,
+  "combined_cut_witness": {
+    "source_zones": ["MID", "SRC1", "SRC2"],
+    "cut_segments": ["p3", "p4"],
+    "merged_segment_ids": ["p3", "p4"],
+    "closed_cut_segments": ["p3"],
+    "additional_cut_segments": ["p4"],
+    "closed_cost": 5,
+    "additional_cost": 7,
+    "total_cost": 12
+  },
+  "plan": {"zones": ["..."], "segments": ["..."], "sources": ["..."], "protections": ["..."]},
+  "adopted_result": {"source_zones": ["..."], "cut_segments": ["..."], "total_cost": 10}
+}
+```
+
+- `closed_segment_ids`：现场确实关闭的管段，必须全部存在于采用快照中，
+  未知或重复 ID 返回 422 且不写复核记录；空列表表示尚未关闭任何管段。
+- `additional_cut_segments` / `additional_cost`：还应追加关闭的管段及费用。
+  若现场关闭集合已经隔断全部路径，二者分别为空列表和 `0`，不会为了形式
+  追加零费用边。
+- `combined_cut_witness.cut_segments` 是冻结方案中跨越最终源侧边界的
+  管段；`merged_segment_ids` 是现场关闭与新增建议的完整并集，可包含不在
+  最终边界上的冗余现场关闭。
+- 复核记录不可变，且只能新增、读取；不会修改原方案、计算记录、采用快照或
+  采用历史。数据库写入失败时整个事务回滚，不留下半条记录。
+- 为兼容调用方，也接受 `closed_segments` 请求字段，以及
+  `/plans/{plan_id}/reviews`、`/plans/{plan_id}/adoption/reviews`、
+  `/plans/{plan_id}/adoption/execution-reviews` 路径。
+
 ### 错误代码
 
 | HTTP | code | 含义 |
 | --- | --- | --- |
 | 400 | `INVALID_JSON` | 请求体不是合法 JSON |
-| 404 | `PLAN_NOT_FOUND` / `COMPUTATION_NOT_FOUND` / `ADOPTION_NOT_FOUND` / `NOT_FOUND` | 资源不存在 |
+| 404 | `PLAN_NOT_FOUND` / `COMPUTATION_NOT_FOUND` / `ADOPTION_NOT_FOUND` / `EXECUTION_REVIEW_NOT_FOUND` / `NOT_FOUND` | 资源不存在 |
 | 409 | `REVISION_CONFLICT` | 保存冲突，`details[].code` 区分：`PLAN_ALREADY_EXISTS`（并发首次创建同一方案，落败请求）/ `REVISION_MISMATCH`（携带的 `expected_revision` 已过期，方案在读取后被他人修改）；重新读取当前方案与修订号后再提交 |
 | 409 | `COMPUTATION_ALREADY_ADOPTED` / `COMPUTATION_NOT_ADOPTABLE` / `ADOPTION_CONFLICT` | 计算已被采用过（含已被替换下来的历史采用）/ 计算未成功 / 并发采用时当前生效结果已被他人改变，请重新查询后再采用 |
-| 422 | `VALIDATION_ERROR` | 负载非法，`details[].code` 给出细分原因（如 `INVALID_ZONE_ID`、`DUPLICATE_SEGMENT_ID`、`UNKNOWN_ZONE`、`INVALID_COST`、`EMPTY_SOURCES`、`SOURCE_PROTECTION_OVERLAP`、`TOO_MANY_ZONES`、`TOO_MANY_SEGMENTS`、`INVALID_EXPECTED_REVISION` 等） |
-| 500 | `INTERNAL_ERROR` / `COMPUTATION_FAILED` | 服务内部错误 |
+| 422 | `VALIDATION_ERROR` | 负载非法，`details[].code` 给出细分原因（如 `INVALID_ZONE_ID`、`DUPLICATE_SEGMENT_ID`、`UNKNOWN_ZONE`、`UNKNOWN_SEGMENT`、`INVALID_COST`、`EMPTY_SOURCES`、
+`SOURCE_PROTECTION_OVERLAP`、`TOO_MANY_ZONES`、`TOO_MANY_SEGMENTS`、
+`INVALID_EXPECTED_REVISION`、`INVALID_CLOSED_SEGMENTS_FIELD`、
+`MISSING_CLOSED_SEGMENT_IDS` 等） |
+| 500 | `INTERNAL_ERROR` / `COMPUTATION_FAILED` / `EXECUTION_REVIEW_WRITE_FAILED` | 服务内部错误；复核写入失败会回滚，不留半条复核记录 |
 
 非法整版、计算失败、采用不存在或已采用过的结果，以及并发保存的落败
 写入，都**不会**改写当前方案或已采用结果。
@@ -218,6 +280,10 @@ pytest
 - `tests/test_snapshot.py`：计算后修订再采用时快照的方案/修订/清单/费用
   逐项冻结且能隔断快照内污染路径；采用被替换后旧计算不可重用；历史采用
   次数核对；冲突不改写当前方案与生效快照。
+- `tests/test_execution_review_flow.py`：对小图的每个管段关闭子集独立枚举
+  对拍，覆盖非建议管段先被关闭、零费用边、已经隔断时新增清单为空。
+- `tests/test_execution_reviews.py`：执行复核接口的冻结版本见证、方案修订后
+  复核、未知/重复输入不写记录、写入失败原子回滚、重启后按 ID 读取与并发读取。
 - `tests/test_concurrency_pg.py`：**仅在真实 PostgreSQL 下运行**
   （SQLite 自动跳过），在数据库层确定性地卡住两次操作：
   - 并发首次创建同一方案：一胜（200 修订 1）一负（409
@@ -240,8 +306,8 @@ app/
   main.py        FastAPI 路由与全局异常处理
   flow.py        自实现 64 位整数容量 Dinic 最大流 / 最小割
   validation.py  方案负载域校验（稳定错误码）
-  services.py    保存、计算、采用、查询业务逻辑
-  models.py      plans / computations / adoptions / adoption_events 表
+  services.py    保存、计算、采用、执行复核、查询业务逻辑
+  models.py      plans / computations / adoptions / adoption_events / execution_reviews 表
   db.py          引擎、会话、建表（带重试）
   errors.py      统一错误信封
 tests/           穷举对拍 + 单元 + 接口 + 快照 + PostgreSQL 并发验收
