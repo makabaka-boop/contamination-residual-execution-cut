@@ -235,3 +235,88 @@ def validate_plan_payload(data):
         "sources": sources,
         "protections": protections,
     }
+
+
+def validate_review_payload(data):
+    """校验复核请求负载，返回现场已关闭管段 ID 列表（按提交顺序）。
+
+    负载必须是 ``{"closed_segments": [...]}``：每个元素必须是合法管段
+    ID 且不得重复（现场关闭同一管段两次视为负载非法）。ID 是否存在于
+    所采用的冻结方案中，由 validate_segments_known 在拿到冻结版本后
+    再判定——校验与算法、持久层必须使用同一冻结版本。
+    """
+    if not isinstance(data, dict):
+        raise ApiError(
+            422,
+            "VALIDATION_ERROR",
+            "request body must be a JSON object",
+            [_detail("INVALID_BODY", "$", "expected a JSON object")],
+        )
+    raw = data.get("closed_segments")
+    if not isinstance(raw, list):
+        raise ApiError(
+            422,
+            "VALIDATION_ERROR",
+            "closed_segments must be a list of segment ids",
+            [
+                _detail(
+                    "INVALID_CLOSED_SEGMENTS_FIELD",
+                    "closed_segments",
+                    "must be a list of segment ids",
+                )
+            ],
+        )
+
+    details = []
+    seen = set()
+    closed = []
+    for i, seg_id in enumerate(raw):
+        field = f"closed_segments[{i}]"
+        if not _is_valid_id(seg_id):
+            details.append(
+                _detail(
+                    "INVALID_SEGMENT_ID",
+                    field,
+                    "segment id must match [A-Za-z0-9_-]{1,32}",
+                )
+            )
+        elif seg_id in seen:
+            details.append(
+                _detail(
+                    "DUPLICATE_SEGMENT_ID",
+                    field,
+                    f"duplicate segment id {seg_id!r}",
+                )
+            )
+        else:
+            seen.add(seg_id)
+            closed.append(seg_id)
+    if details:
+        raise ApiError(422, "VALIDATION_ERROR", "review payload is invalid", details)
+    return closed
+
+
+def validate_segments_known(closed_ids, frozen_plan):
+    """已关闭管段必须逐一存在于复核所采用的冻结方案中。
+
+    复核只能引用该次采用时冻结的方案：冻结版本中不存在的 ID（包括
+    后来修订才新增的管段）一律以 422 UNKNOWN_SEGMENT 拒绝，调用方
+    不得写库。
+    """
+    known = {seg["id"] for seg in frozen_plan["segments"]}
+    details = [
+        _detail(
+            "UNKNOWN_SEGMENT",
+            f"closed_segments[{i}]",
+            f"segment {seg_id!r} does not exist in the adopted plan",
+        )
+        for i, seg_id in enumerate(closed_ids)
+        if seg_id not in known
+    ]
+    if details:
+        raise ApiError(
+            422,
+            "VALIDATION_ERROR",
+            "closed segments reference segments outside the adopted plan",
+            details,
+        )

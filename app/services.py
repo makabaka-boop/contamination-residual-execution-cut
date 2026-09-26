@@ -27,6 +27,10 @@
   持锁前后一致时才允许写入，否则以 409 ADOPTION_CONFLICT 拒绝，
   保证并发采用的返回结果确定且与最终记录一致。任何失败/冲突都
   回滚，当前方案与原采用快照不变。
+- 复核只读取当前生效采用快照中冻结的方案（不读取当前方案），
+  已关闭管段的存在性校验、剩余网络求解与记录落库共享同一冻结版本；
+  校验失败在写入前拒绝，单行写入失败整体回滚，绝不留下半条复核
+  记录，也不修改方案、计算记录与采用快照。
 """
 
 import uuid
@@ -37,7 +41,8 @@ from sqlalchemy.exc import IntegrityError
 
 from . import models
 from .errors import ApiError
-from .flow import solve_min_cut
+from .flow import solve_min_cut, solve_residual_min_cut
+from .validation import validate_segments_known
 
 
 def get_plan_or_404(db, plan_id):
@@ -345,3 +350,66 @@ def get_adoption(db, plan_id):
             f"plan {plan_id!r} has no adopted result",
         )
     return adoption
+
+
+def review(db, plan_id, closed_ids):
+    """对当前已采用结果执行一次现场关闭复核并持久化复核记录。
+
+    - 复核只读取已采用快照中冻结的方案（采用时刻的版本），绝不读取
+      "当前方案"：后来修订的同名管段费用不会混入，算法、校验、持久化
+      与接口共享同一冻结版本；
+    - 现场已关闭管段视为已移除，在剩余有向网络上沿用同一最小割裁决
+      （最低费用、源侧按包含关系最小、字典序升序）求追加关闭费用
+      最小的隔断；若已隔断，新增清单为空、追加费用为 0；
+    - 复核记录冻结输入与结果，单行整体一次提交：任何校验失败（未知/
+      重复管段、无采用结果）都在写入前拒绝，写入失败整体回滚，绝不
+      留下半条复核记录，也不修改原方案、计算记录或采用快照。
+    """
+    get_plan_or_404(db, plan_id)
+    adoption = get_adoption(db, plan_id)
+    snapshot = adoption.snapshot
+    frozen_plan = snapshot["plan"]
+    # 未知管段（含冻结版本之外、后来修订才出现的 ID）在写入前拒绝
+    validate_segments_known(closed_ids, frozen_plan)
+
+    outcome = solve_residual_min_cut(frozen_plan, closed_ids)
+    created_at = datetime.now(timezone.utc)
+    review_id = uuid.uuid4().hex
+    record = {
+        "review_id": review_id,
+        "plan_id": plan_id,
+        "plan_revision": snapshot["plan_revision"],
+        "computation_id": snapshot["computation_id"],
+        "created_at": created_at.isoformat(),
+        "closed_segments": outcome["closed_segments"],
+        "additional_segments": outcome["additional_segments"],
+        "additional_cost": outcome["additional_cost"],
+        "witness": outcome["witness"],
+    }
+    row = models.Review(
+        review_id=review_id,
+        plan_id=plan_id,
+        computation_id=snapshot["computation_id"],
+        plan_revision=snapshot["plan_revision"],
+        record=record,
+        created_at=created_at,
+    )
+    db.add(row)
+    try:
+        db.commit()
+    except Exception:
+        # 写入失败整体回滚：绝不留下半条复核记录，现状不变
+        db.rollback()
+        raise ApiError(500, "INTERNAL_ERROR", "failed to persist the review")
+    return row
+
+
+def get_review_or_404(db, plan_id, review_id):
+    review = db.get(models.Review, review_id)
+    if review is None or review.plan_id != plan_id:
+        raise ApiError(
+            404,
+            "REVIEW_NOT_FOUND",
+            f"review {review_id!r} does not exist for plan {plan_id!r}",
+        )
+    return review

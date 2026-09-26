@@ -12,7 +12,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from . import services
 from .db import get_db, init_db
 from .errors import ApiError, error_body
-from .validation import validate_plan_payload
+from .validation import validate_plan_payload, validate_review_payload
 
 PLAN_ID_REGEX = r"^[A-Za-z0-9_-]{1,64}$"
 
@@ -220,3 +220,33 @@ def get_adoption(
 ):
     """查询当前已采用结果（完整快照）。"""
     return services.get_adoption(db, plan_id).snapshot
+
+
+@app.post("/plans/{plan_id}/reviews")
+async def create_review(
+    request: Request,
+    plan_id: str = Path(pattern=PLAN_ID_REGEX),
+    db: Session = Depends(get_db),
+):
+    """对当前已采用结果执行现场关闭复核。
+
+    提交现场已关闭管段 ID 集合：服务把这些边视为已移除，只在该次采用
+    快照冻结的方案上（不读取后来修订的同名管段）求追加关闭费用最小的
+    隔断，返回现场已关闭、新增建议、追加费用与合并后的隔断见证。
+    复核记录冻结输入与结果，不修改方案、计算记录或采用快照。
+    """
+    body = await _json_body(request)
+    closed_ids = validate_review_payload(body)
+    review = await to_thread.run_sync(services.review, db, plan_id, closed_ids)
+    return review.record
+
+
+@app.get("/plans/{plan_id}/reviews/{review_id}")
+def get_review(
+    plan_id: str = Path(pattern=PLAN_ID_REGEX),
+    review_id: str = "",
+    db: Session = Depends(get_db),
+):
+    """按 ID 查询复核记录（冻结的输入与结果，重启后仍可读取）。"""
+    services.get_plan_or_404(db, plan_id)
+    return services.get_review_or_404(db, plan_id, review_id).record

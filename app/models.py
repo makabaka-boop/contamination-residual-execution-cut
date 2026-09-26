@@ -90,3 +90,28 @@ class AdoptionEvent(Base):
     plan_revision = Column(Integer, nullable=False)
     snapshot = Column(JSON, nullable=False)  # 采用时刻写入的完整快照
     adopted_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class Review(Base):
+    """现场关闭复核记录：对一次已采用结果的执行复核，只增不改。
+
+    记录冻结复核输入（现场已关闭管段）与复核结果（新增建议、追加
+    费用、合并后的隔断见证），并标注它针对的已采用计算与修订号；
+    全部取自采用快照冻结的同一版本。写入不触碰 plans / computations
+    / adoptions / adoption_events，方案随后修订或采用被替换都不影响
+    已落库的复核记录，可按 review_id 在重启后读取。
+    """
+
+    __tablename__ = "reviews"
+
+    review_id = Column(String(32), primary_key=True)
+    plan_id = Column(
+        String(64), ForeignKey("plans.plan_id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    # 复核所针对的已采用结果（采用快照中的计算），仅作追溯，不约束
+    # 该方案上的采用随后被替换
+    computation_id = Column(String(32), nullable=False, index=True)
+    plan_revision = Column(Integer, nullable=False)
+    record = Column(JSON, nullable=False)  # 冻结的完整输入与结果
+    created_at = Column(DateTime(timezone=True), nullable=False)
